@@ -2,52 +2,59 @@ from transforms.api import transform_df, Input, Output
 from pyspark.sql import functions as F
 from pyspark.sql.types import TimestampType
 
+# ==============================================================
+# BUSINESS LOGIC (Decoupled from Foundry for Unit Testing)
+# ==============================================================
 def clean_flights_logic(df):
+    """
+    Core cleaning logic for flight data.
+    
+    Key Data Quality fixes:
+    1. FlightDate: specific handling of raw long timestamps (microseconds).
+    2. Scheduled Times: Raw source uses an Excel/Lotus epoch (1899) for times, 
+       resulting in negative timestamps. We reconstruct proper ISO timestamps.
+    3. DepDelay: Implements a fallback calculation (Actual - Scheduled) 
+       when the explicit column is missing.
+    """
     
     # ---------------------------------------------------------
-    # 1. GESTION DE LA DATE (FlightDate)
+    # 1. DATE PARSING
     # ---------------------------------------------------------
-    ts_col_name = df.columns[0] # La colonne long du début
+    # The first column contains the flight date in microseconds
+    # We detect it dynamically or use a specific name if known
+    ts_col_name = df.columns[0] 
     
     df = df.withColumn(
         "FlightDate",
         (F.col(ts_col_name) / 1000000).cast(TimestampType()).cast("date")
     )
     
-    # Reconstruction des éléments de date
+    # Extract date parts for partitioning or analysis if needed
     df = df.withColumn("Year", F.year("FlightDate")) \
            .withColumn("Month", F.month("FlightDate")) \
            .withColumn("DayOfMonth", F.dayofmonth("FlightDate")) \
            .withColumn("DayOfWeek", F.dayofweek("FlightDate"))
 
     # ---------------------------------------------------------
-    # 2. GESTION DES HEURES (PREVUES vs REELLES)
+    # 2. TIME RECONSTRUCTION (The "1899 Epoch" Fix)
     # ---------------------------------------------------------
-    
-    # On identifie les paires (NomColonneBrute, NomColonneFinale)
-    # CRSDepTime = Prévu / DepTime = Réel
+    # Mapping raw columns (int/long) to final standard names
     time_cols_map = [
         ("CRSDepTime", "ScheduledDepTime"),
         ("CRSArrTime", "ScheduledArrTime"),
-        ("DepTime", "ActualDepTime"),     # <-- Ajout du temps réel
-        ("ArrTime", "ActualArrTime")      # <-- Ajout de l'arrivée réelle
+        ("DepTime", "ActualDepTime"),
+        ("ArrTime", "ActualArrTime")
     ]
 
     for raw_col, new_col in time_cols_map:
         if raw_col in df.columns:
-            # Conversion du format long/int bizarre en Timestamp complet
-            # On passe par une étape intermédiaire pour extraire l'heure "HH:mm:ss"
-            # car le long raw est basé sur l'année 1899
-            
-            # 1. Cast en timestamp (donne une date en 1899)
-            # Certains fichiers ont des INT (1430), d'autres des LONG (timestamp 1899). 
-            # On gère le cas LONG comme vu précédemment.
+            # Step A: Convert microsecond long to timestamp (often results in 1899-12-30)
             df = df.withColumn(f"temp_{new_col}", (F.col(raw_col) / 1000000).cast(TimestampType()))
             
-            # 2. Extraction HH:mm:ss
+            # Step B: Extract HH:mm:ss string
             df = df.withColumn(f"time_str_{new_col}", F.date_format(F.col(f"temp_{new_col}"), "HH:mm:ss"))
             
-            # 3. Collage sur la vraie FlightDate
+            # Step C: Combine valid FlightDate with extracted Time
             df = df.withColumn(
                 new_col,
                 F.to_timestamp(
@@ -55,35 +62,35 @@ def clean_flights_logic(df):
                     "yyyy-MM-dd HH:mm:ss"
                 )
             )
+            # Cleanup temp columns
             df = df.drop(f"temp_{new_col}", f"time_str_{new_col}")
         else:
-            # Si la colonne n'existe pas (ex: ActualDepTime manquant pour un vol annulé), on met null
+            # Handle missing columns gracefully
             df = df.withColumn(new_col, F.lit(None).cast("timestamp"))
 
     # ---------------------------------------------------------
-    # 3. CALCUL / RECUPERATION DES DELAIS (DepDelay / ArrDelay)
+    # 3. DELAY CALCULATION (Fallback Logic)
     # ---------------------------------------------------------
     
-    # --- ArrDelay ---
+    # ArrDelay: Cast to integer
     if "ArrDelay" in df.columns:
         df = df.withColumn("ArrDelay", F.col("ArrDelay").cast("int"))
     
-    # --- DepDelay (Logique Fallback Intelligente) ---
-    # 1. On cherche la colonne explicite
+    # DepDelay: Critical metric for root cause analysis
+    # Strategy: Check explicit column -> Check alias -> Calculate it
     if "DepDelay" in df.columns:
         df = df.withColumn("DepDelay", F.col("DepDelay").cast("int"))
     elif "DEP_DELAY" in df.columns:
         df = df.withColumn("DepDelay", F.col("DEP_DELAY").cast("int"))
     else:
-        # 2. Si pas de colonne, on CALCULE : (Actual - Scheduled) en minutes
-        # Note : unix_timestamp donne des secondes, on divise par 60
+        # Fallback: Calculate difference in minutes
         df = df.withColumn(
             "DepDelay",
             ((F.unix_timestamp("ActualDepTime") - F.unix_timestamp("ScheduledDepTime")) / 60).cast("int")
         )
 
     # ---------------------------------------------------------
-    # 4. RENOMMAGES ET NETTOYAGE
+    # 4. STANDARDIZATION
     # ---------------------------------------------------------
     rename_map = {
         "UniqueCarrier": "Carrier",
@@ -94,14 +101,15 @@ def clean_flights_logic(df):
         if src in df.columns:
             df = df.withColumnRenamed(src, dst)
 
-    # Nettoyage Strings
+    # String cleaning (Trim & Uppercase)
     for col in ["Origin", "Dest", "TailNum", "Carrier"]:
         if col in df.columns:
             df = df.withColumn(col, F.upper(F.trim(F.col(col))))
 
     # ---------------------------------------------------------
-    # 5. FILTRAGE
+    # 5. DATA QUALITY FILTERING
     # ---------------------------------------------------------
+    # Remove rows where critical business keys are missing
     condition = (
         F.col("FlightDate").isNotNull() &
         F.col("ScheduledDepTime").isNotNull() & 
@@ -110,34 +118,40 @@ def clean_flights_logic(df):
         (F.col("TailNum") != "UNKNOW") 
     )
     
-    df = df.filter(condition)
+    return df.filter(condition)
 
-    return df
 
+# ==============================================================
+# FOUNDRY ORCHESTRATION
+# ==============================================================
 @transform_df(
-    Output("/skywisesandbox-5785ef/Flight Data Project/data/intermediate/clean_flights"),
-    raw_flights=Input("ri.foundry.main.dataset.14bfb5ea-16b6-4181-9000-67237ff5abcc"),
+    Output("/path/to/clean/clean_flights"),
+    raw_flights=Input("RAW_FLIGHTS_DATASET_RID"),
 )
 def compute(raw_flights):
+    # Apply Business Logic
     df = clean_flights_logic(raw_flights)
     
-    # Limit
+    # ---------------------------------------------------------
+    # PRODUCTION SETTINGS
+    # ---------------------------------------------------------
+    # Limit for development/demo purposes (Full dataset is >100M rows)
     df = df.limit(5000000)
     
-    # Sélection finale (On ajoute ActualDepTime pour info)
+    # Final Projection
     keep_cols = [
-        "Year", "Month", "DayOfMonth", "DayOfWeek", "FlightDate",
-        "Carrier", "FlightNumber", "TailNum", 
+        "FlightDate", "Carrier", "FlightNumber", "TailNum", 
         "Origin", "Dest", "Distance",
-        "ScheduledDepTime", "ActualDepTime", # Ajouté pour verif
+        "ScheduledDepTime", "ActualDepTime",
         "ScheduledArrTime", "ActualArrTime",
         "DepDelay", "ArrDelay", "ScheduledElapsedTime"
     ]
     
+    # Select only existing columns to avoid AnalysisException
     final_cols = [c for c in keep_cols if c in df.columns]
     df = df.select(*final_cols)
 
-    # Dedup
+    # Deduplication based on business keys
     df = df.dropDuplicates(["FlightDate", "Carrier", "FlightNumber", "Origin", "Dest"]) \
            .withColumn("ingestion_ts_utc", F.current_timestamp())
 
